@@ -1,4 +1,5 @@
 #include <ArduinoJson.h>
+#include <IRremote.hpp>
 #include <Preferences.h>
 #include <WebSocketsClient.h>
 #include <WiFi.h>
@@ -7,8 +8,11 @@
 const uint32_t BAUD_RATE = 115200;
 const int LED_PIN = 5;
 const int BUTTON_PIN = 6;
+const int IR_RECEIVE_PIN = 4;
 const uint32_t DEBOUNCE_MS = 35;
+const uint32_t IR_REPEAT_GUARD_MS = 140;
 const uint32_t WIFI_RETRY_MS = 10000;
+const bool NEC_CODE_0x16_IS_RIGHT = false;  // false = ENTER, true = RIGHT
 
 const char* WIFI_SSID = WIFI_SSID_VALUE;
 const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
@@ -116,21 +120,25 @@ const char REGISTRATION_PAYLOAD[] PROGMEM = R"json({
 })json";
 
 WebSocketsClient ws;
+WebSocketsClient pointerWs;
 Preferences prefs;
 String clientKey;
 String detectedOnePlayAppId;
 
 bool wsConnected = false;
+bool pointerWsConnected = false;
 bool tvRegistered = false;
 bool listRequested = false;
 bool pendingLaunch = false;
 bool ledState = false;
 bool appInfoRequested = false;
+bool pointerSocketRequested = false;
 
 bool lastButtonReading = HIGH;
 bool stableButtonState = HIGH;
 uint32_t lastDebounceMs = 0;
 uint32_t lastWifiRetryMs = 0;
+uint32_t lastIrActionMs = 0;
 
 bool containsIgnoreCase(const String& haystack, const String& needle) {
   String h = haystack;
@@ -138,6 +146,40 @@ bool containsIgnoreCase(const String& haystack, const String& needle) {
   h.toLowerCase();
   n.toLowerCase();
   return h.indexOf(n) >= 0;
+}
+
+bool parseWebSocketUrl(const String& url, bool& useSsl, String& host, uint16_t& port, String& path) {
+  const int schemeEnd = url.indexOf("://");
+  if (schemeEnd < 0) {
+    return false;
+  }
+
+  const String scheme = url.substring(0, schemeEnd);
+  useSsl = scheme.equalsIgnoreCase("wss");
+
+  const String rest = url.substring(schemeEnd + 3);
+  const int pathStart = rest.indexOf('/');
+  const String hostPort = pathStart >= 0 ? rest.substring(0, pathStart) : rest;
+  path = pathStart >= 0 ? rest.substring(pathStart) : "/";
+
+  if (hostPort.length() == 0) {
+    return false;
+  }
+
+  const int colonPos = hostPort.lastIndexOf(':');
+  if (colonPos >= 0) {
+    host = hostPort.substring(0, colonPos);
+    port = (uint16_t)hostPort.substring(colonPos + 1).toInt();
+  } else {
+    host = hostPort;
+    port = useSsl ? 3001 : 3000;
+  }
+
+  return host.length() > 0 && port > 0;
+}
+
+bool isNecProtocol(decode_type_t protocol) {
+  return protocol == NEC || protocol == NEC2;
 }
 
 void setLed(bool on) {
@@ -149,6 +191,77 @@ void sendJson(JsonDocument& doc) {
   String out;
   serializeJson(doc, out);
   ws.sendTXT(out);
+}
+
+void sendSimpleRequest(const char* requestId, const char* uri) {
+  if (!tvRegistered) {
+    Serial.print("TV not registered, skipped request: ");
+    Serial.println(requestId);
+    return;
+  }
+
+  DynamicJsonDocument doc(256);
+  doc["id"] = requestId;
+  doc["type"] = "request";
+  doc["uri"] = uri;
+  sendJson(doc);
+}
+
+void requestPointerSocket() {
+  if (!tvRegistered) {
+    return;
+  }
+
+  DynamicJsonDocument doc(384);
+  doc["id"] = "pointer_socket";
+  doc["type"] = "request";
+  doc["uri"] = "ssap://com.webos.service.networkinput/getPointerInputSocket";
+  sendJson(doc);
+  pointerSocketRequested = true;
+  Serial.println("Requested pointer input socket");
+}
+
+void connectPointerSocket(const String& socketPath) {
+  bool useSsl = true;
+  String host;
+  String path;
+  uint16_t port = 0;
+
+  if (!parseWebSocketUrl(socketPath, useSsl, host, port, path)) {
+    Serial.print("Failed to parse pointer socket URL: ");
+    Serial.println(socketPath);
+    return;
+  }
+
+  pointerWsConnected = false;
+  if (useSsl) {
+    pointerWs.beginSSL(host.c_str(), port, path.c_str());
+  } else {
+    pointerWs.begin(host.c_str(), port, path.c_str());
+  }
+  pointerWs.setReconnectInterval(5000);
+  pointerWs.enableHeartbeat(15000, 3000, 2);
+
+  Serial.print("Connecting pointer socket: ");
+  Serial.println(socketPath);
+}
+
+void sendPointerButton(const char* buttonName) {
+  if (!pointerWsConnected) {
+    Serial.print("Pointer socket not ready, dropped button: ");
+    Serial.println(buttonName);
+    if (tvRegistered && !pointerSocketRequested) {
+      requestPointerSocket();
+    }
+    return;
+  }
+
+  String payload = "type:button\nname:";
+  payload += buttonName;
+  payload += "\n\n";
+  pointerWs.sendTXT(payload);
+  Serial.print("Sent TV button: ");
+  Serial.println(buttonName);
 }
 
 void requestLaunchPoints() {
@@ -209,6 +322,142 @@ void launchOnePlay() {
   Serial.println(appId);
 }
 
+void handleNecCommand(uint8_t command, bool isRepeat) {
+  if (isRepeat && (millis() - lastIrActionMs) < IR_REPEAT_GUARD_MS) {
+    return;
+  }
+  lastIrActionMs = millis();
+
+  Serial.print("IR NEC command: 0x");
+  if (command < 0x10) {
+    Serial.print("0");
+  }
+  Serial.println(command, HEX);
+
+  switch (command) {
+    case 0x0C:  // OFF
+      sendSimpleRequest("tv_turn_off", "ssap://system/turnOff");
+      break;
+    case 0x6B:  // RED
+      sendPointerButton("RED");
+      break;
+    case 0x6C:  // GREEN
+      sendPointerButton("GREEN");
+      break;
+    case 0x6D:  // YELLOW
+      sendPointerButton("YELLOW");
+      break;
+    case 0x6E:  // BLUE
+      sendPointerButton("BLUE");
+      break;
+    case 0x51:  // REWIND
+      sendPointerButton("REWIND");
+      break;
+    case 0x36:  // STOP
+      sendPointerButton("STOP");
+      break;
+    case 0x50:  // FAST FORWARD
+      sendPointerButton("FASTFORWARD");
+      break;
+    case 0x12:  // MENU
+      sendPointerButton("MENU");
+      break;
+    case 0x16:  // Ambiguous in notes: OK / RIGHT
+      sendPointerButton(NEC_CODE_0x16_IS_RIGHT ? "RIGHT" : "ENTER");
+      break;
+    case 0x10:  // UP
+      sendPointerButton("UP");
+      break;
+    case 0x11:  // DOWN
+      sendPointerButton("DOWN");
+      break;
+    case 0x15:  // LEFT
+      sendPointerButton("LEFT");
+      break;
+    case 0x1F:  // BACK
+      sendPointerButton("BACK");
+      break;
+    case 0x4A:  // INFO
+      sendPointerButton("INFO");
+      break;
+    case 0x1D:  // TV
+      launchOnePlay();
+      break;
+    case 0x0E:  // VOLUME+
+      sendPointerButton("VOLUMEUP");
+      break;
+    case 0x0A:  // VOLUME-
+      sendPointerButton("VOLUMEDOWN");
+      break;
+    case 0x14:  // CHANNEL+
+      sendPointerButton("CHANNELUP");
+      break;
+    case 0x17:  // CHANNEL-
+      sendPointerButton("CHANNELDOWN");
+      break;
+    case 0x0D:  // MUTE
+      sendPointerButton("MUTE");
+      break;
+    case 0x00:
+      sendPointerButton("0");
+      break;
+    case 0x01:
+      sendPointerButton("1");
+      break;
+    case 0x02:
+      sendPointerButton("2");
+      break;
+    case 0x03:
+      sendPointerButton("3");
+      break;
+    case 0x04:
+      sendPointerButton("4");
+      break;
+    case 0x05:
+      sendPointerButton("5");
+      break;
+    case 0x06:
+      sendPointerButton("6");
+      break;
+    case 0x07:
+      sendPointerButton("7");
+      break;
+    case 0x08:
+      sendPointerButton("8");
+      break;
+    case 0x09:
+      sendPointerButton("9");
+      break;
+    default:
+      Serial.print("IR code has no mapping yet: 0x");
+      if (command < 0x10) {
+        Serial.print("0");
+      }
+      Serial.println(command, HEX);
+      break;
+  }
+}
+
+void updateIrReceiver() {
+  if (!IrReceiver.decode()) {
+    return;
+  }
+
+  const decode_type_t protocol = IrReceiver.decodedIRData.protocol;
+  const bool isRepeat = IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT;
+  const uint16_t rawCommand = IrReceiver.decodedIRData.command;
+
+  if (!isNecProtocol(protocol)) {
+    Serial.print("Ignored non-NEC IR protocol: ");
+    Serial.println((int)protocol);
+    IrReceiver.resume();
+    return;
+  }
+
+  handleNecCommand((uint8_t)(rawCommand & 0xFF), isRepeat);
+  IrReceiver.resume();
+}
+
 void sendRegister() {
   DynamicJsonDocument doc(12288);
   DeserializationError err = deserializeJson(doc, REGISTRATION_PAYLOAD);
@@ -259,6 +508,9 @@ void handleWsText(const char* text) {
       appInfoRequested = true;
       requestCurrentAppInfo();
     }
+    if (!pointerSocketRequested) {
+      requestPointerSocket();
+    }
     if (pendingLaunch) {
       pendingLaunch = false;
       launchOnePlay();
@@ -295,6 +547,17 @@ void handleWsText(const char* text) {
   if (id == "launch_oneplay" && type == "response") {
     bool ok = doc["payload"]["returnValue"] | false;
     Serial.println(ok ? "OnePlay launch command accepted" : "OnePlay launch command rejected");
+    return;
+  }
+
+  if (id == "pointer_socket" && type == "response") {
+    const String socketPath = doc["payload"]["socketPath"] | "";
+    if (socketPath.length() == 0) {
+      Serial.println("Pointer socket response missing socketPath");
+      pointerSocketRequested = false;
+      return;
+    }
+    connectPointerSocket(socketPath);
     return;
   }
 
@@ -336,6 +599,9 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
       tvRegistered = false;
       listRequested = false;
       appInfoRequested = false;
+      pointerSocketRequested = false;
+      pointerWsConnected = false;
+      pointerWs.disconnect();
       setLed(false);
       Serial.println("WS disconnected");
       break;
@@ -344,11 +610,39 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
       tvRegistered = false;
       listRequested = false;
       appInfoRequested = false;
+      pointerSocketRequested = false;
       Serial.println("WS connected");
       sendRegister();
       break;
     case WStype_TEXT:
       handleWsText((const char*)payload);
+      break;
+    default:
+      break;
+  }
+}
+
+void onPointerWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      pointerWsConnected = false;
+      pointerSocketRequested = false;
+      Serial.println("Pointer socket disconnected");
+      break;
+    case WStype_CONNECTED:
+      pointerWsConnected = true;
+      Serial.println("Pointer socket connected");
+      break;
+    case WStype_TEXT:
+      if (length > 0) {
+        String msg;
+        msg.reserve(length);
+        for (size_t i = 0; i < length; ++i) {
+          msg += (char)payload[i];
+        }
+        Serial.print("Pointer socket message: ");
+        Serial.println(msg);
+      }
       break;
     default:
       break;
@@ -385,6 +679,8 @@ void setupWebSocket() {
   ws.onEvent(onWsEvent);
   ws.setReconnectInterval(5000);
   ws.enableHeartbeat(15000, 3000, 2);
+
+  pointerWs.onEvent(onPointerWsEvent);
 }
 
 void updateButton() {
@@ -414,6 +710,10 @@ void setup() {
   delay(400);
   Serial.println("ESP32-S3 LG OnePlay launcher start");
   Serial.println("Button on IO6, LED on IO5");
+  Serial.print("IR receiver on IO");
+  Serial.println(IR_RECEIVE_PIN);
+
+  IrReceiver.begin(IR_RECEIVE_PIN, DISABLE_LED_FEEDBACK);
 
   prefs.begin("lg_remote", false);
   clientKey = prefs.getString("client_key", "");
@@ -424,9 +724,11 @@ void setup() {
 
 void loop() {
   updateButton();
+  updateIrReceiver();
 
   if (WiFi.status() == WL_CONNECTED) {
     ws.loop();
+    pointerWs.loop();
   } else {
     if (millis() - lastWifiRetryMs > WIFI_RETRY_MS) {
       lastWifiRetryMs = millis();
