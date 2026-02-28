@@ -1,0 +1,8 @@
+#pragma once
+
+// Copy to esp32_test/config.h and fill your values.
+#define WIFI_SSID_VALUE "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD_VALUE "YOUR_WIFI_PASSWORD"
+#define TV_IP_VALUE "192.168.1.49"
+#define TV_PORT_VALUE 3001
+#define ONEPLAY_APP_ID_VALUE "voyo.cz"
