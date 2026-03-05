@@ -54,8 +54,16 @@ const PulseDistanceMapEntry PULSE_DISTANCE_MAP[] = {
   {0x5060008, 27, 0x18},  // RIGHT (live capture frame A)
   {0x4030088, 27, 0x18},  // RIGHT (live capture frame B)
   {0x1110088, 26, 0x1F},  // BACK
+  {0x1150008, 27, 0x1F},  // BACK (live capture frame A)
+  {0x4A8088, 26, 0x1F},   // BACK (live capture frame B)
   {0x2220008, 27, 0x4A},  // INFO
   {0x910088, 26, 0x1D},   // TV
+  {0x2400008, 28, 0x14},  // CHANNEL+ (live capture frame A)
+  {0x200088, 28, 0x14},   // CHANNEL+ (live capture frame B)
+  {0x4040008, 28, 0x17},  // CHANNEL- (live capture frame A)
+  {0x1020088, 27, 0x17},  // CHANNEL- (live capture frame B)
+  {0x6240008, 27, 0x17},  // CHANNEL- (live capture frame C)
+  {0x2920088, 26, 0x17},  // CHANNEL- (live capture frame D)
   {0x10E0008, 27, 0x0A},  // VOLUME- (swapped per live test)
   {0x470088, 26, 0x0E},   // VOLUME+ (swapped per live test)
   // Alternate volume frames captured during focused VOL+/VOL- test.
@@ -190,6 +198,8 @@ bool appInfoRequested = false;
 bool pointerSocketRequested = false;
 bool muteTogglePending = false;
 String pendingPointerButton;
+bool oneplayMenuOpened = false;
+bool oneplaySessionActive = false;
 
 bool lastButtonReading = HIGH;
 bool stableButtonState = HIGH;
@@ -481,9 +491,33 @@ void launchOnePlay() {
   doc["uri"] = "ssap://com.webos.applicationManager/launch";
   doc["payload"]["id"] = appId;
   sendJson(doc);
+  oneplayMenuOpened = false;
+  oneplaySessionActive = true;
 
   Serial.print("Launch requested for app id: ");
   Serial.println(appId);
+}
+
+void handleOnePlayMenuShortcut() {
+  // First press: launch OnePlay. Next presses: toggle in-app list/menu.
+  if (!oneplaySessionActive) {
+    launchOnePlay();
+    Serial.println("OnePlay shortcut: launch");
+    return;
+  }
+
+  handleMenuToggle();
+}
+
+void handleMenuToggle() {
+  if (oneplayMenuOpened) {
+    sendPointerButton("BACK");
+    Serial.println("Menu toggle: BACK (return to playback)");
+  } else {
+    sendPointerButton("MENU");
+    Serial.println("Menu toggle: MENU (open OnePlay menu)");
+  }
+  oneplayMenuOpened = !oneplayMenuOpened;
 }
 
 void handleNecCommand(uint8_t command, bool isRepeat) {
@@ -530,8 +564,8 @@ void handleNecCommand(uint8_t command, bool isRepeat) {
     case 0x3F:  // REC
       Serial.println("REC has no configured SSAP action");
       break;
-    case 0x12:  // MENU (mapped to webOS Home launcher/menu)
-      sendPointerOrSimpleRequest("HOME", "tv_menu", "ssap://system.launcher/open");
+    case 0x12:  // MENU: launch OnePlay first, then toggle in-app menu list
+      handleOnePlayMenuShortcut();
       break;
     case 0x41:  // EPG
       sendSimpleRequest("tv_epg_info", "ssap://tv/getChannelProgramInfo");
@@ -560,11 +594,12 @@ void handleNecCommand(uint8_t command, bool isRepeat) {
       break;
     case 0x1F:  // BACK
       sendPointerButton("BACK");
+      oneplayMenuOpened = false;
       break;
     case 0x4A:  // INFO
       sendPointerOrSimpleRequest("INFO", "tv_info", "ssap://com.webos.applicationManager/getForegroundAppInfo");
       break;
-    case 0x1D:  // TV
+    case 0x1D:  // TV key keeps direct OnePlay launch shortcut
       launchOnePlay();
       break;
     case 0x0E:  // VOLUME+
@@ -574,10 +609,10 @@ void handleNecCommand(uint8_t command, bool isRepeat) {
       sendVolumeAction("tv_volume_down", "ssap://audio/volumeDown", "VOLUMEDOWN");
       break;
     case 0x14:  // CHANNEL+
-      sendPointerOrSimpleRequest("CHANNELUP", "tv_channel_up", "ssap://tv/channelUp");
+      sendPointerButton("CHANNELUP");
       break;
     case 0x17:  // CHANNEL-
-      sendPointerOrSimpleRequest("CHANNELDOWN", "tv_channel_down", "ssap://tv/channelDown");
+      sendPointerButton("CHANNELDOWN");
       break;
     case 0x0D:  // MUTE
       if (pointerWsConnected) {
@@ -759,6 +794,9 @@ void handleWsText(const char* text) {
 
   if (id == "launch_oneplay" && type == "response") {
     bool ok = doc["payload"]["returnValue"] | false;
+    if (!ok) {
+      oneplaySessionActive = false;
+    }
     Serial.println(ok ? "OnePlay launch command accepted" : "OnePlay launch command rejected");
     return;
   }
@@ -827,6 +865,8 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
       appInfoRequested = false;
       pointerSocketRequested = false;
       pointerWsConnected = false;
+      oneplaySessionActive = false;
+      oneplayMenuOpened = false;
       pointerWs.disconnect();
       setLed(false);
       Serial.println("WS disconnected");
