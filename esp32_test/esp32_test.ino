@@ -10,11 +10,15 @@ const int LED_PIN = 5;
 const int BUTTON_PIN = 6;
 const int IR_RECEIVE_PIN = 4;
 const uint32_t DEBOUNCE_MS = 35;
-const uint32_t IR_REPEAT_GUARD_MS = 140;
+const uint32_t IR_REPEAT_GUARD_MS = 220;
 const uint32_t WIFI_RETRY_MS = 10000;
 const bool NEC_CODE_0x16_IS_RIGHT = false;  // false = ENTER, true = RIGHT
 const bool LOG_ALL_IR_PACKETS = true;
 const bool LOG_RAW_IR_TIMINGS = true;
+const uint8_t CLIENT_KEY_SCHEMA_VERSION = 2;  // Bump to force re-pairing when manifest permissions change.
+const bool RUN_ARROW_URI_PROBE_ON_REGISTER = false;
+const bool REQUEST_APP_LIST_ON_REGISTER = false;
+const bool REQUEST_CURRENT_APP_INFO_ON_REGISTER = false;
 
 struct PulseDistanceMapEntry {
   uint32_t rawData;
@@ -32,7 +36,6 @@ const PulseDistanceMapEntry PULSE_DISTANCE_MAP[] = {
   {0xA8088, 26, 0x6D},    // YELLOW
   {0xC400008, 28, 0x6E},  // BLUE
   {0x5200088, 27, 0x51},  // REWIND
-  {0x2080008, 28, 0x36},  // STOP
   {0x40088, 28, 0x50},    // FAST FORWARD
   {0x4400008, 29, 0x3F},  // REC
   {0x1200088, 28, 0x12},  // MENU
@@ -40,9 +43,16 @@ const PulseDistanceMapEntry PULSE_DISTANCE_MAP[] = {
   {0x68088, 26, 0x3C},    // TXT
   {0x28D0008, 26, 0x16},  // OK
   {0x2068088, 26, 0x10},  // UP
+  {0x2040088, 27, 0x10},  // UP (live capture variant)
   {0x2180008, 27, 0x11},  // DOWN
+  {0x3050008, 27, 0x11},  // DOWN (live capture frame A)
+  {0x2028088, 27, 0x11},  // DOWN (live capture frame B)
+  {0x3050008, 26, 0x15},  // LEFT (live capture frame A)
+  {0x2028088, 26, 0x15},  // LEFT (live capture frame B)
   {0x8C0088, 26, 0x15},   // LEFT
   {0x1220008, 27, 0x18},  // RIGHT (custom command code, see switch case)
+  {0x5060008, 27, 0x18},  // RIGHT (live capture frame A)
+  {0x4030088, 27, 0x18},  // RIGHT (live capture frame B)
   {0x1110088, 26, 0x1F},  // BACK
   {0x2220008, 27, 0x4A},  // INFO
   {0x910088, 26, 0x1D},   // TV
@@ -111,7 +121,10 @@ const char REGISTRATION_PAYLOAD[] PROGMEM = R"json({
         "CONTROL_INPUT_MEDIA_PLAYBACK",
         "CONTROL_INPUT_TV",
         "CONTROL_POWER",
+        "CONTROL_INPUT_TEXT",
+        "CONTROL_MOUSE_AND_KEYBOARD",
         "READ_APP_STATUS",
+        "READ_INSTALLED_APPS",
         "READ_CURRENT_CHANNEL",
         "READ_INPUT_DEVICE_LIST",
         "READ_NETWORK_STATE",
@@ -183,6 +196,7 @@ bool stableButtonState = HIGH;
 uint32_t lastDebounceMs = 0;
 uint32_t lastWifiRetryMs = 0;
 uint32_t lastIrActionMs = 0;
+uint8_t lastIrCommand = 0xFF;
 
 bool containsIgnoreCase(const String& haystack, const String& needle) {
   String h = haystack;
@@ -265,8 +279,9 @@ void sendJson(JsonDocument& doc) {
 bool isValidPointerButtonName(const String& buttonName) {
   static const char* VALID_BUTTONS[] = {
     "MUTE", "RED", "GREEN", "YELLOW", "BLUE", "HOME", "MENU", "VOLUMEUP", "VOLUMEDOWN",
-    "CHANNELUP", "CHANNELDOWN", "*", "CC", "BACK", "UP", "DOWN", "LEFT", "RIGHT",
-    "ENTER", "DASH", "EXIT", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
+    "CHANNELUP", "CHANNELDOWN", "*", "ASTERISK", "CC", "BACK", "UP", "DOWN", "LEFT", "RIGHT",
+    "ENTER", "DASH", "INFO", "EXIT", "PLAY", "PAUSE", "STOP", "REWIND", "FASTFORWARD",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
   };
   for (size_t i = 0; i < (sizeof(VALID_BUTTONS) / sizeof(VALID_BUTTONS[0])); ++i) {
     if (buttonName.equalsIgnoreCase(VALID_BUTTONS[i])) {
@@ -437,6 +452,21 @@ void requestCurrentAppInfo() {
   Serial.println("Requested foreground app info (launcher)");
 }
 
+void runArrowUriProbe() {
+  if (!tvRegistered) {
+    return;
+  }
+
+  // Diagnostic probe: test if any non-pointer directional endpoints are accepted.
+  sendSimpleRequest("probe_services", "ssap://api/getServiceList");
+  sendSimpleRequest("probe_key_up", "ssap://com.webos.service.tv.keycontrol/up");
+  sendSimpleRequest("probe_key_down", "ssap://com.webos.service.tv.keycontrol/down");
+  sendSimpleRequest("probe_key_left", "ssap://com.webos.service.tv.keycontrol/left");
+  sendSimpleRequest("probe_key_right", "ssap://com.webos.service.tv.keycontrol/right");
+  sendSimpleRequest("probe_send_enter", "ssap://com.webos.service.ime/sendEnterKey");
+  Serial.println("Arrow URI probe requests sent");
+}
+
 void launchOnePlay() {
   if (!tvRegistered) {
     pendingLaunch = true;
@@ -457,9 +487,13 @@ void launchOnePlay() {
 }
 
 void handleNecCommand(uint8_t command, bool isRepeat) {
+  if (command == lastIrCommand && (millis() - lastIrActionMs) < IR_REPEAT_GUARD_MS) {
+    return;
+  }
   if (isRepeat && (millis() - lastIrActionMs) < IR_REPEAT_GUARD_MS) {
     return;
   }
+  lastIrCommand = command;
   lastIrActionMs = millis();
 
   Serial.print("IR NEC command: 0x");
@@ -485,19 +519,19 @@ void handleNecCommand(uint8_t command, bool isRepeat) {
       sendPointerButton("BLUE");
       break;
     case 0x51:  // REWIND
-      sendSimpleRequest("tv_rewind", "ssap://media.controls/rewind");
+      sendPointerOrSimpleRequest("REWIND", "tv_rewind", "ssap://media.controls/rewind");
       break;
     case 0x36:  // STOP
-      sendSimpleRequest("tv_stop", "ssap://media.controls/stop");
+      sendPointerOrSimpleRequest("STOP", "tv_stop", "ssap://media.controls/stop");
       break;
     case 0x50:  // FAST FORWARD
-      sendSimpleRequest("tv_fast_forward", "ssap://media.controls/fastForward");
+      sendPointerOrSimpleRequest("FASTFORWARD", "tv_fast_forward", "ssap://media.controls/fastForward");
       break;
     case 0x3F:  // REC
       Serial.println("REC has no configured SSAP action");
       break;
-    case 0x12:  // MENU
-      sendPointerButton("MENU");
+    case 0x12:  // MENU (mapped to webOS Home launcher/menu)
+      sendPointerOrSimpleRequest("HOME", "tv_menu", "ssap://system.launcher/open");
       break;
     case 0x41:  // EPG
       sendSimpleRequest("tv_epg_info", "ssap://tv/getChannelProgramInfo");
@@ -528,7 +562,7 @@ void handleNecCommand(uint8_t command, bool isRepeat) {
       sendPointerButton("BACK");
       break;
     case 0x4A:  // INFO
-      sendSimpleRequest("tv_foreground_info", "ssap://com.webos.applicationManager/getForegroundAppInfo");
+      sendPointerOrSimpleRequest("INFO", "tv_info", "ssap://com.webos.applicationManager/getForegroundAppInfo");
       break;
     case 0x1D:  // TV
       launchOnePlay();
@@ -676,16 +710,19 @@ void handleWsText(const char* text) {
     }
     Serial.println("Registered with TV");
 
-    if (!listRequested) {
+    if (REQUEST_APP_LIST_ON_REGISTER && !listRequested) {
       listRequested = true;
       requestLaunchPoints();
     }
-    if (!appInfoRequested) {
+    if (REQUEST_CURRENT_APP_INFO_ON_REGISTER && !appInfoRequested) {
       appInfoRequested = true;
       requestCurrentAppInfo();
     }
     if (!pointerSocketRequested) {
       requestPointerSocket();
+    }
+    if (RUN_ARROW_URI_PROBE_ON_REGISTER) {
+      runArrowUriProbe();
     }
     if (pendingLaunch) {
       pendingLaunch = false;
@@ -911,6 +948,12 @@ void setup() {
   IrReceiver.begin(IR_RECEIVE_PIN, DISABLE_LED_FEEDBACK);
 
   prefs.begin("lg_remote", false);
+  const uint8_t storedKeySchema = prefs.getUChar("client_key_schema", 0);
+  if (storedKeySchema != CLIENT_KEY_SCHEMA_VERSION) {
+    prefs.remove("client_key");
+    prefs.putUChar("client_key_schema", CLIENT_KEY_SCHEMA_VERSION);
+    Serial.println("Saved client-key cleared (schema update). Pairing prompt expected on TV.");
+  }
   clientKey = prefs.getString("client_key", "");
 
   connectWifiBlocking();
